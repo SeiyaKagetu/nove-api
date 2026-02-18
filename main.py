@@ -114,10 +114,13 @@ def send_email(to: str, subject: str, body: str):
     msg["From"] = SMTP_USER
     msg["To"] = to
     msg.attach(MIMEText(body, "html", "utf-8"))
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(SMTP_USER, to, msg.as_string())
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_USER, to, msg.as_string())
+    except Exception as e:
+        print(f"[MAIL ERROR] {e}")
 
 # ─────────────────────────────
 # モデル定義
