@@ -8,9 +8,7 @@ from fastapi import FastAPI, HTTPException, Depends, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from typing import Optional
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import resend
 import sqlite3
 import uuid
 import hashlib
@@ -97,28 +95,25 @@ def verify_admin(x_admin_token: str = Header(...)):
     return True
 
 # ─────────────────────────────
-# メール送信
+# メール送信（Resend HTTP API）
 # ─────────────────────────────
-SMTP_HOST   = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT   = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER   = os.getenv("SMTP_USER", "")
-SMTP_PASS   = os.getenv("SMTP_PASS", "")
-NOTIFY_TO   = os.getenv("NOTIFY_TO", "myseiyakagetu@proton.me")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+MAIL_FROM      = os.getenv("MAIL_FROM", "NOVE OS <onboarding@resend.dev>")
+NOTIFY_TO      = os.getenv("NOTIFY_TO", "myseiyakagetu@proton.me")
 
 def send_email(to: str, subject: str, body: str):
-    if not SMTP_USER or not SMTP_PASS:
+    if not RESEND_API_KEY:
         print(f"[MAIL SKIP] To:{to} Subject:{subject}")
         return
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = SMTP_USER
-    msg["To"] = to
-    msg.attach(MIMEText(body, "html", "utf-8"))
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASS)
-            server.sendmail(SMTP_USER, to, msg.as_string())
+        resend.api_key = RESEND_API_KEY
+        resend.Emails.send({
+            "from": MAIL_FROM,
+            "to": [to],
+            "subject": subject,
+            "html": body,
+        })
+        print(f"[MAIL OK] To:{to} Subject:{subject}")
     except Exception as e:
         print(f"[MAIL ERROR] {e}")
 
