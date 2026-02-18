@@ -76,10 +76,19 @@ def init_db():
             valid_until  TEXT NOT NULL,
             is_active    INTEGER DEFAULT 1,
             note         TEXT,
+            machine_id   TEXT,
+            activated_at TEXT,
             created_at   TEXT DEFAULT (datetime('now', 'localtime'))
         )
     """)
     conn.commit()
+    # マイグレーション: 既存DBにmachine_idカラムを追加
+    for col in ["machine_id TEXT", "activated_at TEXT"]:
+        try:
+            conn.execute(f"ALTER TABLE licenses ADD COLUMN {col}")
+            conn.commit()
+        except Exception:
+            pass
     conn.close()
 
 init_db()
@@ -152,6 +161,10 @@ class LicenseCreate(BaseModel):
     customer_email: EmailStr
     months:         int = 12
     note:           Optional[str] = None
+
+class LicenseActivate(BaseModel):
+    license_key: str
+    machine_id:  str
 
 # ─────────────────────────────
 # お問い合わせAPI
@@ -270,6 +283,43 @@ NOVE OS Systems | <a href="https://noveos.jp">https://noveos.jp</a>
         "valid_until": valid_until,
         "server_limit": server_limit
     }
+
+
+@app.post("/api/license/activate", summary="ライセンス認証・マシン紐付け")
+async def activate_license(data: LicenseActivate, db: sqlite3.Connection = Depends(get_db)):
+    row = db.execute("SELECT * FROM licenses WHERE license_key=?", (data.license_key,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="ライセンスキーが見つかりません")
+    r = dict(row)
+    today = datetime.now().strftime("%Y-%m-%d")
+    if not r["is_active"]:
+        raise HTTPException(status_code=403, detail="このライセンスは無効化されています")
+    if r["valid_until"] < today:
+        raise HTTPException(status_code=403, detail=f"ライセンスの有効期限が切れています（期限: {r['valid_until']}）")
+    # 未登録 → 初回アクティベーション
+    if not r.get("machine_id"):
+        db.execute(
+            "UPDATE licenses SET machine_id=?, activated_at=? WHERE license_key=?",
+            (data.machine_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), data.license_key)
+        )
+        db.commit()
+        return {"is_valid": True, "status": "activated", "plan": r["plan"],
+                "valid_until": r["valid_until"], "server_limit": r["server_limit"]}
+    # 登録済み → マシンID一致確認
+    if r["machine_id"] != data.machine_id:
+        raise HTTPException(
+            status_code=403,
+            detail="このライセンスは別のマシンで登録済みです。マシン変更はサポート(myseiyakagetu@proton.me)までご連絡ください。"
+        )
+    return {"is_valid": True, "status": "valid", "plan": r["plan"],
+            "valid_until": r["valid_until"], "server_limit": r["server_limit"]}
+
+
+@app.post("/api/license/{key}/reset-machine", summary="マシン紐付けリセット（管理者）")
+async def reset_machine(key: str, admin=Depends(verify_admin), db: sqlite3.Connection = Depends(get_db)):
+    db.execute("UPDATE licenses SET machine_id=NULL, activated_at=NULL WHERE license_key=?", (key,))
+    db.commit()
+    return {"status": "ok", "message": f"{key} のマシン紐付けをリセットしました"}
 
 
 @app.get("/api/license/validate/{key}", summary="ライセンス有効性確認")
