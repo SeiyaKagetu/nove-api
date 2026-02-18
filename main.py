@@ -21,7 +21,7 @@ load_dotenv()
 app = FastAPI(
     title="NOVE OS API",
     description="NOVE OS v13.2 バックエンドAPI",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 # CORS設定（noveos.jpからのリクエストを許可）
@@ -76,19 +76,20 @@ def init_db():
             valid_until  TEXT NOT NULL,
             is_active    INTEGER DEFAULT 1,
             note         TEXT,
-            machine_id   TEXT,
-            activated_at TEXT,
             created_at   TEXT DEFAULT (datetime('now', 'localtime'))
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS activations (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            license_key  TEXT NOT NULL,
+            machine_id   TEXT NOT NULL,
+            activated_at TEXT DEFAULT (datetime('now', 'localtime')),
+            last_seen    TEXT DEFAULT (datetime('now', 'localtime')),
+            UNIQUE(license_key, machine_id)
+        )
+    """)
     conn.commit()
-    # マイグレーション: 既存DBにmachine_idカラムを追加
-    for col in ["machine_id TEXT", "activated_at TEXT"]:
-        try:
-            conn.execute(f"ALTER TABLE licenses ADD COLUMN {col}")
-            conn.commit()
-        except Exception:
-            pass
     conn.close()
 
 init_db()
@@ -285,41 +286,107 @@ NOVE OS Systems | <a href="https://noveos.jp">https://noveos.jp</a>
     }
 
 
-@app.post("/api/license/activate", summary="ライセンス認証・マシン紐付け")
+@app.post("/api/license/activate", summary="ライセンス認証・マシン登録")
 async def activate_license(data: LicenseActivate, db: sqlite3.Connection = Depends(get_db)):
-    row = db.execute("SELECT * FROM licenses WHERE license_key=?", (data.license_key,)).fetchone()
+    """
+    インストーラーから呼ばれるエンドポイント。
+    1. ライセンスキーの有効性を確認
+    2. サーバー台数上限チェック（同一マシンは重複カウントしない）
+    3. マシンIDを activations テーブルに記録
+    4. プラン情報を返す
+    """
+    row = db.execute(
+        "SELECT * FROM licenses WHERE license_key=?", (data.license_key,)
+    ).fetchone()
+
     if not row:
         raise HTTPException(status_code=404, detail="ライセンスキーが見つかりません")
-    r = dict(row)
+
+    lic = dict(row)
     today = datetime.now().strftime("%Y-%m-%d")
-    if not r["is_active"]:
+
+    if not lic["is_active"]:
         raise HTTPException(status_code=403, detail="このライセンスは無効化されています")
-    if r["valid_until"] < today:
-        raise HTTPException(status_code=403, detail=f"ライセンスの有効期限が切れています（期限: {r['valid_until']}）")
-    # 未登録 → 初回アクティベーション
-    if not r.get("machine_id"):
-        db.execute(
-            "UPDATE licenses SET machine_id=?, activated_at=? WHERE license_key=?",
-            (data.machine_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), data.license_key)
-        )
-        db.commit()
-        return {"is_valid": True, "status": "activated", "plan": r["plan"],
-                "valid_until": r["valid_until"], "server_limit": r["server_limit"]}
-    # 登録済み → マシンID一致確認
-    if r["machine_id"] != data.machine_id:
+
+    if lic["valid_until"] < today:
         raise HTTPException(
             status_code=403,
-            detail="このライセンスは別のマシンで登録済みです。マシン変更はサポート(myseiyakagetu@proton.me)までご連絡ください。"
+            detail=f"ライセンスの有効期限が切れています（期限: {lic['valid_until']}）"
         )
-    return {"is_valid": True, "status": "valid", "plan": r["plan"],
-            "valid_until": r["valid_until"], "server_limit": r["server_limit"]}
+
+    # 同一マシンはすでに登録済みか確認
+    already = db.execute(
+        "SELECT id FROM activations WHERE license_key=? AND machine_id=?",
+        (data.license_key, data.machine_id)
+    ).fetchone()
+
+    if not already:
+        # 現在のアクティベーション台数を確認
+        count = db.execute(
+            "SELECT COUNT(*) FROM activations WHERE license_key=?",
+            (data.license_key,)
+        ).fetchone()[0]
+
+        server_limit = lic["server_limit"]
+        # server_limit=0 は無制限（無料相談・trial等）
+        if server_limit > 0 and count >= server_limit:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"サーバー台数の上限（{server_limit}台）に達しています。"
+                    "ライセンスのアップグレードはサポート(myseiyakagetu@proton.me)までご連絡ください。"
+                )
+            )
+
+        # 新規マシンを登録
+        db.execute(
+            "INSERT INTO activations(license_key, machine_id) VALUES(?,?)",
+            (data.license_key, data.machine_id)
+        )
+        db.commit()
+        status = "activated"
+    else:
+        # 既存マシン: last_seen を更新
+        db.execute(
+            "UPDATE activations SET last_seen=datetime('now','localtime') "
+            "WHERE license_key=? AND machine_id=?",
+            (data.license_key, data.machine_id)
+        )
+        db.commit()
+        status = "valid"
+
+    # アクティベーション済み台数
+    activated_count = db.execute(
+        "SELECT COUNT(*) FROM activations WHERE license_key=?",
+        (data.license_key,)
+    ).fetchone()[0]
+
+    return {
+        "is_valid":        True,
+        "status":          status,
+        "plan":            lic["plan"],
+        "customer_name":   lic["customer_name"],
+        "valid_until":     lic["valid_until"],
+        "server_limit":    lic["server_limit"],
+        "activated_count": activated_count,
+    }
 
 
-@app.post("/api/license/{key}/reset-machine", summary="マシン紐付けリセット（管理者）")
-async def reset_machine(key: str, admin=Depends(verify_admin), db: sqlite3.Connection = Depends(get_db)):
-    db.execute("UPDATE licenses SET machine_id=NULL, activated_at=NULL WHERE license_key=?", (key,))
+@app.get("/api/license/{key}/activations", summary="マシン一覧（管理者）")
+async def list_activations(key: str, admin=Depends(verify_admin), db: sqlite3.Connection = Depends(get_db)):
+    rows = db.execute(
+        "SELECT * FROM activations WHERE license_key=? ORDER BY activated_at DESC", (key,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.delete("/api/license/{key}/activations/{machine_id}", summary="マシン登録解除（管理者）")
+async def remove_activation(key: str, machine_id: str, admin=Depends(verify_admin), db: sqlite3.Connection = Depends(get_db)):
+    db.execute(
+        "DELETE FROM activations WHERE license_key=? AND machine_id=?", (key, machine_id)
+    )
     db.commit()
-    return {"status": "ok", "message": f"{key} のマシン紐付けをリセットしました"}
+    return {"status": "ok", "message": f"マシン {machine_id} の登録を解除しました"}
 
 
 @app.get("/api/license/validate/{key}", summary="ライセンス有効性確認")
@@ -331,13 +398,26 @@ async def validate_license(key: str, db: sqlite3.Connection = Depends(get_db)):
     today = datetime.now().strftime("%Y-%m-%d")
     r["is_expired"] = (r["valid_until"] < today)
     r["is_valid"]   = bool(r["is_active"]) and not r["is_expired"]
+    # アクティベーション台数を追加
+    count = db.execute(
+        "SELECT COUNT(*) FROM activations WHERE license_key=?", (key,)
+    ).fetchone()[0]
+    r["activated_count"] = count
     return r
 
 
 @app.get("/api/licenses", summary="ライセンス一覧（管理者）")
 async def list_licenses(admin=Depends(verify_admin), db: sqlite3.Connection = Depends(get_db)):
     rows = db.execute("SELECT * FROM licenses ORDER BY created_at DESC").fetchall()
-    return [dict(r) for r in rows]
+    result = []
+    for row in rows:
+        r = dict(row)
+        count = db.execute(
+            "SELECT COUNT(*) FROM activations WHERE license_key=?", (r["license_key"],)
+        ).fetchone()[0]
+        r["activated_count"] = count
+        result.append(r)
+    return result
 
 
 @app.delete("/api/license/{key}", summary="ライセンス無効化（管理者）")
@@ -349,4 +429,4 @@ async def revoke_license(key: str, admin=Depends(verify_admin), db: sqlite3.Conn
 
 @app.get("/", summary="ヘルスチェック")
 async def root():
-    return {"status": "ok", "service": "NOVE OS API v1.0", "docs": "/docs"}
+    return {"status": "ok", "service": "NOVE OS API v1.1", "docs": "/docs"}
