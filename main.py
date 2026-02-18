@@ -4,7 +4,7 @@ FastAPI + SQLite
 機能: お問い合わせフォーム処理 / ライセンスキー発行・管理
 """
 
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from typing import Optional
@@ -162,7 +162,7 @@ class LicenseCreate(BaseModel):
 # お問い合わせAPI
 # ─────────────────────────────
 @app.post("/api/contact", summary="お問い合わせ送信")
-async def submit_contact(form: ContactForm, db: sqlite3.Connection = Depends(get_db)):
+async def submit_contact(form: ContactForm, background_tasks: BackgroundTasks, db: sqlite3.Connection = Depends(get_db)):
     # DB保存
     db.execute(
         "INSERT INTO contacts(user_type,name,email,company,plan,message) VALUES(?,?,?,?,?,?)",
@@ -185,7 +185,7 @@ async def submit_contact(form: ContactForm, db: sqlite3.Connection = Depends(get
 </table>
 <p style="color:#666;font-size:12px;">NOVE OS API - {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
 """
-    send_email(NOTIFY_TO, f"【お問い合わせ】{form.user_type} / {form.name}様", admin_body)
+    background_tasks.add_task(send_email, NOTIFY_TO, f"【お問い合わせ】{form.user_type} / {form.name}様", admin_body)
 
     # 自動返信メール
     reply_body = f"""
@@ -202,7 +202,7 @@ NOVE OS Systems | myseiyakagetu@proton.me<br>
 <a href="https://noveos.jp">https://noveos.jp</a>
 </p>
 """
-    send_email(form.email, "【受付完了】お問い合わせありがとうございます - NOVE OS", reply_body)
+    background_tasks.add_task(send_email, form.email, "【受付完了】お問い合わせありがとうございます - NOVE OS", reply_body)
 
     return {"status": "ok", "message": "送信完了しました"}
 
@@ -222,7 +222,7 @@ def generate_key(plan: str) -> str:
 
 
 @app.post("/api/license/generate", summary="ライセンスキー発行（管理者）")
-async def create_license(data: LicenseCreate, admin=Depends(verify_admin), db: sqlite3.Connection = Depends(get_db)):
+async def create_license(data: LicenseCreate, background_tasks: BackgroundTasks, admin=Depends(verify_admin), db: sqlite3.Connection = Depends(get_db)):
     plan_info = PLAN_LABELS.get(data.plan)
     if not plan_info:
         raise HTTPException(status_code=400, detail="不明なプランです")
@@ -263,8 +263,8 @@ async def create_license(data: LicenseCreate, admin=Depends(verify_admin), db: s
 NOVE OS Systems | <a href="https://noveos.jp">https://noveos.jp</a>
 </p>
 """
-    send_email(data.customer_email, f"【NOVE OS】ライセンスキーのご案内 - {plan_name}", mail_body)
-    send_email(NOTIFY_TO, f"【発行完了】{data.customer_name}様 / {plan_name}", f"Key: {key}<br>Email: {data.customer_email}")
+    background_tasks.add_task(send_email, data.customer_email, f"【NOVE OS】ライセンスキーのご案内 - {plan_name}", mail_body)
+    background_tasks.add_task(send_email, NOTIFY_TO, f"【発行完了】{data.customer_name}様 / {plan_name}", f"Key: {key}<br>Email: {data.customer_email}")
 
     return {
         "status": "ok",
