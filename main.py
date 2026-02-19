@@ -151,6 +151,7 @@ PLAN_LABELS = {
     "standard":    ("スタンダード",   500,   "¥1,000,000/月"),
     "enterprise":  ("エンタープライズ", 99999, "¥1,500,000~/月"),
     "beta":        ("ベータテスト",   50,    "50%割引"),
+    "trial14":     ("14日間無料トライアル", 1, "無料"),
     "trial":       ("お試し相談",     0,     "無料"),
     "consultation":("無料相談",       0,     "無料"),
     "other":       ("その他",         0,     "-"),
@@ -166,6 +167,95 @@ class LicenseCreate(BaseModel):
 class LicenseActivate(BaseModel):
     license_key: str
     machine_id:  str
+
+class TrialRequest(BaseModel):
+    name:    str
+    email:   EmailStr
+    company: Optional[str] = None
+
+# ─────────────────────────────
+# トライアルAPI（公開）
+# ─────────────────────────────
+@app.post("/api/trial/request", summary="14日間無料トライアル申込（公開）")
+async def request_trial(data: TrialRequest, background_tasks: BackgroundTasks, db: sqlite3.Connection = Depends(get_db)):
+    # 同一メールでのトライアル重複チェック
+    existing = db.execute(
+        "SELECT id FROM licenses WHERE customer_email=? AND plan='trial14'",
+        (data.email,)
+    ).fetchone()
+    if existing:
+        raise HTTPException(status_code=409, detail="このメールアドレスはすでにトライアルを使用済みです")
+
+    plan_name, server_limit, _ = PLAN_LABELS["trial14"]
+    key = generate_key("trial14")
+    valid_from  = datetime.now().strftime("%Y-%m-%d")
+    valid_until = (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
+
+    try:
+        db.execute(
+            """INSERT INTO licenses(license_key,plan,customer_name,customer_email,
+               server_limit,valid_from,valid_until,note)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (key, "trial14", data.name, data.email,
+             server_limit, valid_from, valid_until, f"会社: {data.company or '未記入'}")
+        )
+        db.commit()
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=500, detail="キー生成に失敗しました。再試行してください。")
+
+    # コンタクト保存
+    db.execute(
+        "INSERT INTO contacts(user_type,name,email,company,plan,message) VALUES(?,?,?,?,?,?)",
+        ("トライアル", data.name, data.email, data.company, "trial14", "14日間無料トライアル申込")
+    )
+    db.commit()
+
+    install_cmd = f"curl -fsSL https://noveos.jp/install.sh | sudo bash -s {key}"
+
+    # ユーザーへメール
+    user_body = f"""
+<div style="font-family:sans-serif;max-width:600px;margin:0 auto;background:#0d1117;color:#f0f6fc;padding:24px;border-radius:12px;">
+<h2 style="color:#30d158;">🎉 NOVE OS v13.2 14日間無料トライアル開始！</h2>
+<p>{data.name} 様</p>
+<p>14日間無料トライアルへのご参加ありがとうございます。<br>
+Rocky Linux NOVE OS v13.2 チームです。</p>
+<table border="1" cellpadding="10" style="border-collapse:collapse;min-width:400px;margin:16px 0;">
+<tr style="background:#0071e3;color:#fff;"><th colspan="2" style="padding:12px;">トライアル情報</th></tr>
+<tr style="background:#161b22;"><th style="color:#8b949e;text-align:left;padding:10px;">ライセンスキー</th>
+    <td><strong style="font-size:17px;font-family:monospace;color:#ffd60a;">{key}</strong></td></tr>
+<tr style="background:#0d1117;"><th style="color:#8b949e;text-align:left;padding:10px;">有効期間</th>
+    <td style="color:#f0f6fc;">{valid_from} 〜 <strong>{valid_until}</strong>（14日間）</td></tr>
+<tr style="background:#161b22;"><th style="color:#8b949e;text-align:left;padding:10px;">対応サーバー</th>
+    <td style="color:#f0f6fc;">1台</td></tr>
+</table>
+<p style="margin-top:20px;"><strong>📦 インストール方法（Rocky Linux / RHEL系）:</strong></p>
+<pre style="background:#1f2937;color:#30d158;padding:14px;border-radius:8px;overflow-x:auto;font-size:13px;">{install_cmd}</pre>
+<hr style="border-color:#30303a;margin:24px 0;">
+<p style="color:#8b949e;font-size:13px;">
+ご不明な点はお気軽にお問い合わせください。<br>
+トライアル終了後はそのままご契約いただけます。<br><br>
+NOVE OS Systems | <a href="https://noveos.jp" style="color:#0071e3;">https://noveos.jp</a> | myseiyakagetu@proton.me
+</p>
+</div>
+"""
+    background_tasks.add_task(
+        send_email, data.email,
+        "【NOVE OS】14日間無料トライアル開始 - ライセンスキーのご案内",
+        user_body
+    )
+    background_tasks.add_task(
+        send_email, NOTIFY_TO,
+        f"【トライアル申込】{data.name}様 / {data.email}",
+        f"Key: {key}<br>Company: {data.company or '-'}<br>Valid: {valid_until}"
+    )
+
+    return {
+        "status":      "ok",
+        "license_key": key,
+        "valid_until": valid_until,
+        "install_cmd": install_cmd,
+    }
+
 
 # ─────────────────────────────
 # お問い合わせAPI
