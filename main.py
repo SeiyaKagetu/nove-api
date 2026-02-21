@@ -567,4 +567,4 @@ async def revoke_license(key: str, admin=Depends(verify_admin), db: sqlite3.Conn
 
 @app.get("/", summary="ヘルスチェック")
 async def root():
-    return {"status": "ok", "service": "NOVE OS API v1.1", "docs": "/docs"}
+    return {"status": "ok", "service": "NOVE OS API v1.2", "docs": "/docs"}
