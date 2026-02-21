@@ -8,20 +8,28 @@ from fastapi import FastAPI, HTTPException, Depends, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from typing import Optional
-import resend
 import sqlite3
 import uuid
-import hashlib
 import os
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# Resendはオプション（インストールされていれば使用）
+try:
+    import resend as _resend_module
+    _RESEND_AVAILABLE = True
+except ImportError:
+    _RESEND_AVAILABLE = False
+
 app = FastAPI(
     title="NOVE OS API",
     description="NOVE OS v13.2 バックエンドAPI",
-    version="1.1.0"
+    version="1.2.0"
 )
 
 # CORS設定（noveos.jpからのリクエストを許可）
@@ -105,27 +113,67 @@ def verify_admin(x_admin_token: str = Header(...)):
     return True
 
 # ─────────────────────────────
-# メール送信（Resend HTTP API）
+# メール送信（Resend優先 → SMTP(Gmail)フォールバック）
 # ─────────────────────────────
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
-MAIL_FROM      = os.getenv("MAIL_FROM", "NOVE OS <onboarding@resend.dev>")
+MAIL_FROM      = os.getenv("MAIL_FROM", "NOVE OS <noreply@noveos.jp>")
 NOTIFY_TO      = os.getenv("NOTIFY_TO", "myseiyakagetu@proton.me")
 
+# SMTP設定（Gmail App Password等）
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+
+
+def _send_via_resend(to: str, subject: str, body: str):
+    """Resend APIでメール送信"""
+    if not _RESEND_AVAILABLE:
+        raise RuntimeError("resend package not installed")
+    _resend_module.api_key = RESEND_API_KEY
+    _resend_module.Emails.send({
+        "from": MAIL_FROM,
+        "to": [to],
+        "subject": subject,
+        "html": body,
+    })
+
+
+def _send_via_smtp(to: str, subject: str, body: str):
+    """SMTP(Gmail等)でメール送信"""
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = SMTP_USER
+    msg["To"]      = to
+    msg.attach(MIMEText(body, "html", "utf-8"))
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
+        s.ehlo()
+        s.starttls()
+        s.login(SMTP_USER, SMTP_PASS)
+        s.sendmail(SMTP_USER, [to], msg.as_string())
+
+
 def send_email(to: str, subject: str, body: str):
-    if not RESEND_API_KEY:
-        print(f"[MAIL SKIP] To:{to} Subject:{subject}")
-        return
-    try:
-        resend.api_key = RESEND_API_KEY
-        resend.Emails.send({
-            "from": MAIL_FROM,
-            "to": [to],
-            "subject": subject,
-            "html": body,
-        })
-        print(f"[MAIL OK] To:{to} Subject:{subject}")
-    except Exception as e:
-        print(f"[MAIL ERROR] {e}")
+    """Resend優先 → SMTPフォールバックでメール送信"""
+    # Resend優先
+    if RESEND_API_KEY and _RESEND_AVAILABLE:
+        try:
+            _send_via_resend(to, subject, body)
+            print(f"[MAIL OK/Resend] To:{to} Subject:{subject}")
+            return
+        except Exception as e:
+            print(f"[MAIL WARN/Resend] {e} → SMTPへフォールバック")
+
+    # SMTPフォールバック
+    if SMTP_USER and SMTP_PASS:
+        try:
+            _send_via_smtp(to, subject, body)
+            print(f"[MAIL OK/SMTP] To:{to} Subject:{subject}")
+            return
+        except Exception as e:
+            print(f"[MAIL ERROR/SMTP] {e}")
+    else:
+        print(f"[MAIL SKIP] メール設定未完了 - To:{to} Subject:{subject}")
 
 # ─────────────────────────────
 # モデル定義
