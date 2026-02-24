@@ -807,6 +807,19 @@ NOVE OS Systems | <a href="https://noveos.jp" style="color:#6366f1;">https://nov
     return {"status": "ok", "license_key": key}
 
 
+@app.get("/debug/stripe", summary="Stripe設定確認（管理者用）")
+async def debug_stripe(x_admin_token: str = Header(default="")):
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return {
+        "stripe_available": _STRIPE_AVAILABLE,
+        "stripe_key_set": bool(STRIPE_SECRET_KEY),
+        "webhook_secret_set": bool(STRIPE_WEBHOOK_SECRET),
+        "price_ids": {k: bool(v) for k, v in STRIPE_PRICE_IDS.items()},
+        "price_ids_raw": {k: v[:20] + "..." if v else "" for k, v in STRIPE_PRICE_IDS.items()},
+    }
+
+
 @app.get("/", summary="ヘルスチェック")
 async def root():
     return {"status": "ok", "service": "NOVE OS API v1.2", "docs": "/docs"}
