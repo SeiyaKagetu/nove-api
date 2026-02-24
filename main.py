@@ -613,7 +613,8 @@ async def send_email_api(data: SendEmailRequest, admin=Depends(verify_admin)):
 </div></body></html>"""
 
     # 同期送信（失敗時はエラーを返す）
-    last_error = None
+    resend_error = None
+    smtp_error   = None
 
     # Resend優先
     if RESEND_API_KEY and _RESEND_AVAILABLE:
@@ -622,7 +623,7 @@ async def send_email_api(data: SendEmailRequest, admin=Depends(verify_admin)):
             print(f"[MAIL OK/Resend] To:{data.to} Subject:{data.subject}")
             return {"status": "ok", "message": f"{data.to} へ送信しました（Resend）", "method": "resend"}
         except Exception as e:
-            last_error = str(e)
+            resend_error = str(e)
             print(f"[MAIL WARN/Resend] {e} → SMTPへフォールバック")
 
     # SMTPフォールバック
@@ -632,11 +633,14 @@ async def send_email_api(data: SendEmailRequest, admin=Depends(verify_admin)):
             print(f"[MAIL OK/SMTP] To:{data.to} Subject:{data.subject}")
             return {"status": "ok", "message": f"{data.to} へ送信しました（SMTP）", "method": "smtp"}
         except Exception as e:
-            last_error = str(e)
+            smtp_error = str(e)
             print(f"[MAIL ERROR/SMTP] {e}")
 
-    # 全て失敗
-    raise HTTPException(status_code=500, detail=f"メール送信に失敗しました: {last_error}")
+    # 全て失敗 - 両方のエラーを返す
+    errors = []
+    if resend_error: errors.append(f"Resend: {resend_error}")
+    if smtp_error:   errors.append(f"SMTP: {smtp_error}")
+    raise HTTPException(status_code=500, detail=" / ".join(errors) or "メール設定を確認してください")
 
 
 @app.get("/", summary="ヘルスチェック")
