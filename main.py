@@ -585,23 +585,58 @@ class SendEmailRequest(BaseModel):
 
 
 @app.post("/api/send-email", summary="メール送信（管理者）")
-async def send_email_api(data: SendEmailRequest, background_tasks: BackgroundTasks, admin=Depends(verify_admin)):
-    """管理パネルから任意のメールを送信する"""
+async def send_email_api(data: SendEmailRequest, admin=Depends(verify_admin)):
+    """管理パネルから任意のメールを送信する（同期送信・失敗時は500を返す）"""
     if not data.to or "@" not in data.to:
         raise HTTPException(status_code=400, detail="有効なメールアドレスを指定してください")
     if not (SMTP_USER and SMTP_PASS) and not (RESEND_API_KEY and _RESEND_AVAILABLE):
         raise HTTPException(status_code=503, detail="メール設定が未完了です。Railway の Variables に SMTP_USER / SMTP_PASS を設定してください。")
 
-    # プレーンテキストを HTML に変換（改行 → <br>）
-    html_body = data.body.replace("\n", "<br>")
-    html_body = f"""<div style="font-family:sans-serif;max-width:680px;margin:0 auto;color:#333;">
-{html_body}
-<hr style="margin-top:32px;border-color:#eee;">
-<p style="color:#999;font-size:12px;">NOVE OS Systems | <a href="https://noveos.jp">https://noveos.jp</a></p>
-</div>"""
+    # HTML判定: すでにHTMLなら変換せずそのまま使用
+    stripped = data.body.strip()
+    if stripped.startswith('<'):
+        html_body = data.body
+    else:
+        # プレーンテキストをNOVE OSデザインのHTMLに変換
+        text_html = data.body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
+        html_body = f"""<!DOCTYPE html><html><head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:20px;background:#050509;font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',sans-serif;">
+<div style="max-width:600px;margin:0 auto;background:#0d1117;border:1px solid rgba(255,255,255,0.08);border-radius:12px;overflow:hidden;">
+  <div style="background:linear-gradient(135deg,#3b4fd8,#6366f1);padding:24px 28px;">
+    <div style="font-size:11px;color:rgba(255,255,255,0.6);letter-spacing:2px;text-transform:uppercase;margin-bottom:6px;">NOVE OS SYSTEMS</div>
+    <h1 style="margin:0;color:#ffffff;font-size:20px;font-weight:700;">お知らせ</h1>
+  </div>
+  <div style="padding:28px;color:#e2e8f0;font-size:14px;line-height:1.8;">{text_html}</div>
+  <div style="padding:16px 28px;border-top:1px solid rgba(255,255,255,0.06);text-align:center;">
+    <p style="margin:0;font-size:12px;color:#4b5563;">NOVE OS Systems &nbsp;|&nbsp; <a href="https://noveos.jp" style="color:#6366f1;text-decoration:none;">https://noveos.jp</a> &nbsp;|&nbsp; <a href="mailto:myseiyakagetu@proton.me" style="color:#6366f1;text-decoration:none;">myseiyakagetu@proton.me</a></p>
+  </div>
+</div></body></html>"""
 
-    background_tasks.add_task(send_email, data.to, data.subject, html_body)
-    return {"status": "ok", "message": f"{data.to} へのメール送信をキューに追加しました"}
+    # 同期送信（失敗時はエラーを返す）
+    last_error = None
+
+    # Resend優先
+    if RESEND_API_KEY and _RESEND_AVAILABLE:
+        try:
+            _send_via_resend(data.to, data.subject, html_body)
+            print(f"[MAIL OK/Resend] To:{data.to} Subject:{data.subject}")
+            return {"status": "ok", "message": f"{data.to} へ送信しました（Resend）", "method": "resend"}
+        except Exception as e:
+            last_error = str(e)
+            print(f"[MAIL WARN/Resend] {e} → SMTPへフォールバック")
+
+    # SMTPフォールバック
+    if SMTP_USER and SMTP_PASS:
+        try:
+            _send_via_smtp(data.to, data.subject, html_body)
+            print(f"[MAIL OK/SMTP] To:{data.to} Subject:{data.subject}")
+            return {"status": "ok", "message": f"{data.to} へ送信しました（SMTP）", "method": "smtp"}
+        except Exception as e:
+            last_error = str(e)
+            print(f"[MAIL ERROR/SMTP] {e}")
+
+    # 全て失敗
+    raise HTTPException(status_code=500, detail=f"メール送信に失敗しました: {last_error}")
 
 
 @app.get("/", summary="ヘルスチェック")
