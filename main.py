@@ -565,6 +565,45 @@ async def revoke_license(key: str, admin=Depends(verify_admin), db: sqlite3.Conn
     return {"status": "ok", "message": f"{key} を無効化しました"}
 
 
+@app.get("/api/mail/status", summary="メール設定確認")
+async def mail_status(admin=Depends(verify_admin)):
+    """SMTP / Resend の設定状態を確認"""
+    return {
+        "smtp_configured": bool(SMTP_USER and SMTP_PASS),
+        "resend_configured": bool(RESEND_API_KEY and _RESEND_AVAILABLE),
+        "smtp_host": SMTP_HOST if SMTP_USER else "(未設定)",
+        "smtp_user": SMTP_USER[:4] + "****" if SMTP_USER else "(未設定)",
+        "mail_from": MAIL_FROM,
+        "notify_to": NOTIFY_TO,
+    }
+
+
+class SendEmailRequest(BaseModel):
+    to:      str
+    subject: str
+    body:    str
+
+
+@app.post("/api/send-email", summary="メール送信（管理者）")
+async def send_email_api(data: SendEmailRequest, background_tasks: BackgroundTasks, admin=Depends(verify_admin)):
+    """管理パネルから任意のメールを送信する"""
+    if not data.to or "@" not in data.to:
+        raise HTTPException(status_code=400, detail="有効なメールアドレスを指定してください")
+    if not (SMTP_USER and SMTP_PASS) and not (RESEND_API_KEY and _RESEND_AVAILABLE):
+        raise HTTPException(status_code=503, detail="メール設定が未完了です。Railway の Variables に SMTP_USER / SMTP_PASS を設定してください。")
+
+    # プレーンテキストを HTML に変換（改行 → <br>）
+    html_body = data.body.replace("\n", "<br>")
+    html_body = f"""<div style="font-family:sans-serif;max-width:680px;margin:0 auto;color:#333;">
+{html_body}
+<hr style="margin-top:32px;border-color:#eee;">
+<p style="color:#999;font-size:12px;">NOVE OS Systems | <a href="https://noveos.jp">https://noveos.jp</a></p>
+</div>"""
+
+    background_tasks.add_task(send_email, data.to, data.subject, html_body)
+    return {"status": "ok", "message": f"{data.to} へのメール送信をキューに追加しました"}
+
+
 @app.get("/", summary="ヘルスチェック")
 async def root():
     return {"status": "ok", "service": "NOVE OS API v1.2", "docs": "/docs"}
