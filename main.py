@@ -643,6 +643,170 @@ async def send_email_api(data: SendEmailRequest, admin=Depends(verify_admin)):
     raise HTTPException(status_code=500, detail=" / ".join(errors) or "メール設定を確認してください")
 
 
+# ─────────────────────────────
+# Stripe 決済連携
+# ─────────────────────────────
+try:
+    import stripe as _stripe
+    _STRIPE_AVAILABLE = True
+except ImportError:
+    _STRIPE_AVAILABLE = False
+
+STRIPE_SECRET_KEY      = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET  = os.getenv("STRIPE_WEBHOOK_SECRET", "")  # whsec_...
+
+# プランごとの Stripe Price ID（Railway Variables に設定）
+STRIPE_PRICE_IDS = {
+    "personal":   os.getenv("STRIPE_PRICE_PERSONAL",   ""),
+    "academic":   os.getenv("STRIPE_PRICE_ACADEMIC",   ""),
+    "startup":    os.getenv("STRIPE_PRICE_STARTUP",    ""),
+    "standard":   os.getenv("STRIPE_PRICE_STANDARD",   ""),
+    "enterprise": os.getenv("STRIPE_PRICE_ENTERPRISE", ""),
+}
+
+
+class CheckoutRequest(BaseModel):
+    plan:         str
+    success_url:  str = "https://noveos.jp/success.html"
+    cancel_url:   str = "https://noveos.jp/pricing.html"
+
+
+@app.post("/api/stripe/checkout", summary="Stripe Checkout セッション作成")
+async def create_checkout(data: CheckoutRequest):
+    """フロントから呼び出してStripe決済ページのURLを返す"""
+    if not _STRIPE_AVAILABLE or not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Stripe未設定")
+
+    price_id = STRIPE_PRICE_IDS.get(data.plan, "")
+    if not price_id:
+        raise HTTPException(status_code=400, detail=f"プラン '{data.plan}' のPrice IDが未設定です")
+
+    _stripe.api_key = STRIPE_SECRET_KEY
+    plan_info = PLAN_LABELS.get(data.plan)
+    plan_name = plan_info[0] if plan_info else data.plan
+
+    session = _stripe.checkout.Session.create(
+        mode="subscription",
+        line_items=[{"price": price_id, "quantity": 1}],
+        metadata={"plan": data.plan, "plan_name": plan_name},
+        customer_creation="always",
+        billing_address_collection="required",
+        success_url=data.success_url + "?session_id={CHECKOUT_SESSION_ID}",
+        cancel_url=data.cancel_url,
+    )
+    return {"url": session.url, "session_id": session.id}
+
+
+@app.post("/webhook/stripe", summary="Stripe Webhook（決済完了→ライセンス自動発行）")
+async def stripe_webhook(request: Request):
+    """
+    Stripe から POST される Webhook を受け取り、
+    checkout.session.completed イベントでライセンスを自動発行する。
+    署名検証あり（STRIPE_WEBHOOK_SECRET 必須）。
+    """
+    if not _STRIPE_AVAILABLE or not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Stripe未設定")
+
+    payload   = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+
+    # 署名検証
+    try:
+        _stripe.api_key = STRIPE_SECRET_KEY
+        event = _stripe.Webhook.construct_event(
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
+        )
+    except _stripe.error.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="署名検証失敗")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # checkout.session.completed のみ処理
+    if event["type"] != "checkout.session.completed":
+        return {"status": "ignored", "type": event["type"]}
+
+    session        = event["data"]["object"]
+    customer_email = (session.get("customer_details") or {}).get("email") or session.get("customer_email", "")
+    customer_name  = (session.get("customer_details") or {}).get("name") or "お客様"
+    plan           = (session.get("metadata") or {}).get("plan", "personal")
+    plan_name      = (session.get("metadata") or {}).get("plan_name", plan)
+    amount_total   = session.get("amount_total", 0)  # 円（JPY）
+
+    if not customer_email:
+        print(f"[STRIPE WARN] メールアドレスが取得できませんでした session={session.get('id')}")
+        return {"status": "warn", "detail": "email not found"}
+
+    # ライセンス発行
+    plan_info    = PLAN_LABELS.get(plan, ("カスタム", 1, "-"))
+    server_limit = plan_info[1]
+    key          = generate_key(plan)
+    valid_from   = datetime.now().strftime("%Y-%m-%d")
+    valid_until  = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")  # 1ヶ月
+    install_cmd  = f"curl -fsSL https://noveos.jp/install.sh | sudo bash -s {key}"
+
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute(
+            """INSERT INTO licenses(license_key,plan,customer_name,customer_email,
+               server_limit,valid_from,valid_until,note)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (key, plan, customer_name, customer_email,
+             server_limit, valid_from, valid_until,
+             f"Stripe自動発行 session={session.get('id')} amount={amount_total}円")
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        print(f"[STRIPE ERROR] キー重複 session={session.get('id')}")
+        return {"status": "error", "detail": "key conflict"}
+    finally:
+        conn.close()
+
+    # 顧客へライセンスキー送付メール
+    mail_body = f"""
+<div style="font-family:sans-serif;max-width:600px;margin:0 auto;background:#0d1117;color:#f0f6fc;padding:24px;border-radius:12px;">
+<div style="background:linear-gradient(135deg,#3b4fd8,#6366f1);padding:20px 24px;border-radius:8px;margin-bottom:24px;">
+  <div style="font-size:11px;color:rgba(255,255,255,0.6);letter-spacing:2px;text-transform:uppercase;">NOVE OS SYSTEMS</div>
+  <h1 style="margin:8px 0 0;color:#fff;font-size:22px;">🎉 ご購入ありがとうございます！</h1>
+</div>
+<p>{customer_name} 様</p>
+<p>NOVE OS v13.2 <strong>{plan_name}</strong> プランのご購入を確認しました。<br>
+ライセンスキーをご案内します。</p>
+<table border="0" cellpadding="12" style="width:100%;border-collapse:collapse;background:#161b22;border-radius:8px;margin:16px 0;">
+<tr><td style="color:#8b949e;width:40%;">ライセンスキー</td>
+    <td><strong style="font-size:18px;font-family:monospace;color:#ffd60a;">{key}</strong></td></tr>
+<tr style="border-top:1px solid #30363d;"><td style="color:#8b949e;">プラン</td>
+    <td style="color:#f0f6fc;">{plan_name}</td></tr>
+<tr style="border-top:1px solid #30363d;"><td style="color:#8b949e;">サーバー上限</td>
+    <td style="color:#f0f6fc;">{server_limit}台</td></tr>
+<tr style="border-top:1px solid #30363d;"><td style="color:#8b949e;">有効期間</td>
+    <td style="color:#f0f6fc;">{valid_from} 〜 {valid_until}</td></tr>
+</table>
+<p><strong>📦 インストール（Rocky Linux / RHEL系）:</strong></p>
+<pre style="background:#1f2937;color:#30d158;padding:14px;border-radius:8px;font-size:13px;overflow-x:auto;">{install_cmd}</pre>
+<hr style="border-color:#30303a;margin:24px 0;">
+<p style="color:#8b949e;font-size:13px;">
+ご不明な点は <a href="mailto:myseiyakagetu@proton.me" style="color:#6366f1;">myseiyakagetu@proton.me</a> までお気軽にどうぞ。<br>
+NOVE OS Systems | <a href="https://noveos.jp" style="color:#6366f1;">https://noveos.jp</a>
+</p>
+</div>
+"""
+    send_email(
+        customer_email,
+        f"【NOVE OS】ライセンスキーのご案内 - {plan_name}",
+        mail_body
+    )
+    send_email(
+        NOTIFY_TO,
+        f"【Stripe購入完了】{customer_name}様 / {plan_name} / {amount_total}円",
+        f"Key: {key}<br>Email: {customer_email}<br>Plan: {plan_name}<br>Amount: {amount_total}円"
+    )
+
+    print(f"[STRIPE OK] License issued: {key} → {customer_email} ({plan_name})")
+    return {"status": "ok", "license_key": key}
+
+
 @app.get("/", summary="ヘルスチェック")
 async def root():
     return {"status": "ok", "service": "NOVE OS API v1.2", "docs": "/docs"}
