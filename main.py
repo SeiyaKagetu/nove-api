@@ -825,21 +825,6 @@ NOVE OS Systems | <a href="https://noveos.jp" style="color:#6366f1;">https://nov
     return {"status": "ok", "license_key": key}
 
 
-@app.get("/debug/stripe", summary="Stripe設定確認（管理者用）")
-async def debug_stripe(x_admin_token: str = Header(default="")):
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=403, detail="Forbidden")
-    import os as _os
-    stripe_env_keys = [k for k in _os.environ if "STRIPE" in k]
-    return {
-        "stripe_available": _STRIPE_AVAILABLE,
-        "stripe_key_set": bool(_get_stripe_key()),
-        "webhook_secret_set": bool(_get_webhook_secret()),
-        "stripe_env_keys_found": stripe_env_keys,
-        "price_ids": {k: bool(v) for k, v in _get_price_ids().items()},
-        "price_ids_raw": {k: v[:20] + "..." if v else "" for k, v in _get_price_ids().items()},
-    }
-
 
 @app.get("/", summary="ヘルスチェック")
 async def root():
