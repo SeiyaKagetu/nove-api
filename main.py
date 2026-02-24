@@ -686,6 +686,12 @@ class CheckoutRequest(BaseModel):
     cancel_url:   str = "https://noveos.jp/pricing.html"
 
 
+@app.get("/api/debug/stripe-mode", summary="Stripeキーモード確認（デバッグ用）")
+async def debug_stripe_mode():
+    sk = _get_stripe_key()
+    mode = "test" if sk.startswith("sk_test_") else "live" if sk.startswith("sk_live_") else "unset"
+    return {"mode": mode, "key_prefix": sk[:14]+"..." if sk else "none", "available": _STRIPE_AVAILABLE}
+
 @app.post("/api/stripe/checkout", summary="Stripe Checkout セッション作成")
 async def create_checkout(data: CheckoutRequest):
     """フロントから呼び出してStripe決済ページのURLを返す"""
