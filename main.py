@@ -652,15 +652,26 @@ try:
 except ImportError:
     _STRIPE_AVAILABLE = False
 
-def _get_stripe_key()      -> str: return os.getenv("STRIPE_SECRET_KEY", "")
-def _get_webhook_secret()  -> str: return os.getenv("STRIPE_WEBHOOK_SECRET", "")
+def _env(key: str) -> str:
+    """環境変数を取得（キー名の前後スペース・改行を無視）"""
+    val = os.getenv(key, "")
+    if val:
+        return val.strip()
+    # キー名に余分な空白が混入している場合も検索
+    for k, v in os.environ.items():
+        if k.strip() == key:
+            return v.strip()
+    return ""
+
+def _get_stripe_key()      -> str: return _env("STRIPE_SECRET_KEY")
+def _get_webhook_secret()  -> str: return _env("STRIPE_WEBHOOK_SECRET")
 def _get_price_ids()       -> dict:
     return {
-        "personal":   os.getenv("STRIPE_PRICE_PERSONAL",   ""),
-        "academic":   os.getenv("STRIPE_PRICE_ACADEMIC",   ""),
-        "startup":    os.getenv("STRIPE_PRICE_STARTUP",    ""),
-        "standard":   os.getenv("STRIPE_PRICE_STANDARD",   ""),
-        "enterprise": os.getenv("STRIPE_PRICE_ENTERPRISE", ""),
+        "personal":   _env("STRIPE_PRICE_PERSONAL"),
+        "academic":   _env("STRIPE_PRICE_ACADEMIC"),
+        "startup":    _env("STRIPE_PRICE_STARTUP"),
+        "standard":   _env("STRIPE_PRICE_STANDARD"),
+        "enterprise": _env("STRIPE_PRICE_ENTERPRISE"),
     }
 
 # 後方互換用（起動時に一度読む）
