@@ -652,17 +652,21 @@ try:
 except ImportError:
     _STRIPE_AVAILABLE = False
 
-STRIPE_SECRET_KEY      = os.getenv("STRIPE_SECRET_KEY", "")
-STRIPE_WEBHOOK_SECRET  = os.getenv("STRIPE_WEBHOOK_SECRET", "")  # whsec_...
+def _get_stripe_key()      -> str: return os.getenv("STRIPE_SECRET_KEY", "")
+def _get_webhook_secret()  -> str: return os.getenv("STRIPE_WEBHOOK_SECRET", "")
+def _get_price_ids()       -> dict:
+    return {
+        "personal":   os.getenv("STRIPE_PRICE_PERSONAL",   ""),
+        "academic":   os.getenv("STRIPE_PRICE_ACADEMIC",   ""),
+        "startup":    os.getenv("STRIPE_PRICE_STARTUP",    ""),
+        "standard":   os.getenv("STRIPE_PRICE_STANDARD",   ""),
+        "enterprise": os.getenv("STRIPE_PRICE_ENTERPRISE", ""),
+    }
 
-# プランごとの Stripe Price ID（Railway Variables に設定）
-STRIPE_PRICE_IDS = {
-    "personal":   os.getenv("STRIPE_PRICE_PERSONAL",   ""),
-    "academic":   os.getenv("STRIPE_PRICE_ACADEMIC",   ""),
-    "startup":    os.getenv("STRIPE_PRICE_STARTUP",    ""),
-    "standard":   os.getenv("STRIPE_PRICE_STANDARD",   ""),
-    "enterprise": os.getenv("STRIPE_PRICE_ENTERPRISE", ""),
-}
+# 後方互換用（起動時に一度読む）
+STRIPE_SECRET_KEY     = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_IDS      = _get_price_ids()
 
 
 class CheckoutRequest(BaseModel):
@@ -674,14 +678,15 @@ class CheckoutRequest(BaseModel):
 @app.post("/api/stripe/checkout", summary="Stripe Checkout セッション作成")
 async def create_checkout(data: CheckoutRequest):
     """フロントから呼び出してStripe決済ページのURLを返す"""
-    if not _STRIPE_AVAILABLE or not STRIPE_SECRET_KEY:
+    _sk = _get_stripe_key()
+    if not _STRIPE_AVAILABLE or not _sk:
         raise HTTPException(status_code=503, detail="Stripe未設定")
 
-    price_id = STRIPE_PRICE_IDS.get(data.plan, "")
+    price_id = _get_price_ids().get(data.plan, "")
     if not price_id:
         raise HTTPException(status_code=400, detail=f"プラン '{data.plan}' のPrice IDが未設定です")
 
-    _stripe.api_key = STRIPE_SECRET_KEY
+    _stripe.api_key = _sk
     plan_info = PLAN_LABELS.get(data.plan)
     plan_name = plan_info[0] if plan_info else data.plan
 
@@ -704,7 +709,9 @@ async def stripe_webhook(request: Request):
     checkout.session.completed イベントでライセンスを自動発行する。
     署名検証あり（STRIPE_WEBHOOK_SECRET 必須）。
     """
-    if not _STRIPE_AVAILABLE or not STRIPE_SECRET_KEY:
+    _sk = _get_stripe_key()
+    _wh = _get_webhook_secret()
+    if not _STRIPE_AVAILABLE or not _sk:
         raise HTTPException(status_code=503, detail="Stripe未設定")
 
     payload   = await request.body()
@@ -712,9 +719,9 @@ async def stripe_webhook(request: Request):
 
     # 署名検証
     try:
-        _stripe.api_key = STRIPE_SECRET_KEY
+        _stripe.api_key = _sk
         event = _stripe.Webhook.construct_event(
-            payload, sig_header, STRIPE_WEBHOOK_SECRET
+            payload, sig_header, _wh
         )
     except _stripe.error.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="署名検証失敗")
@@ -813,10 +820,10 @@ async def debug_stripe(x_admin_token: str = Header(default="")):
         raise HTTPException(status_code=403, detail="Forbidden")
     return {
         "stripe_available": _STRIPE_AVAILABLE,
-        "stripe_key_set": bool(STRIPE_SECRET_KEY),
-        "webhook_secret_set": bool(STRIPE_WEBHOOK_SECRET),
-        "price_ids": {k: bool(v) for k, v in STRIPE_PRICE_IDS.items()},
-        "price_ids_raw": {k: v[:20] + "..." if v else "" for k, v in STRIPE_PRICE_IDS.items()},
+        "stripe_key_set": bool(_get_stripe_key()),
+        "webhook_secret_set": bool(_get_webhook_secret()),
+        "price_ids": {k: bool(v) for k, v in _get_price_ids().items()},
+        "price_ids_raw": {k: v[:20] + "..." if v else "" for k, v in _get_price_ids().items()},
     }
 
 
