@@ -4,7 +4,7 @@ FastAPI + SQLite
 機能: お問い合わせフォーム処理 / ライセンスキー発行・管理
 """
 
-from fastapi import FastAPI, HTTPException, Depends, Header, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, Header, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from typing import Optional
