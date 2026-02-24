@@ -701,16 +701,21 @@ async def create_checkout(data: CheckoutRequest):
     plan_info = PLAN_LABELS.get(data.plan)
     plan_name = plan_info[0] if plan_info else data.plan
 
-    session = _stripe.checkout.Session.create(
-        mode="subscription",
-        line_items=[{"price": price_id, "quantity": 1}],
-        metadata={"plan": data.plan, "plan_name": plan_name},
-        customer_creation="always",
-        billing_address_collection="required",
-        success_url=data.success_url + "?session_id={CHECKOUT_SESSION_ID}",
-        cancel_url=data.cancel_url,
-    )
-    return {"url": session.url, "session_id": session.id}
+    try:
+        session = _stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            metadata={"plan": data.plan, "plan_name": plan_name},
+            customer_creation="always",
+            billing_address_collection="required",
+            success_url=data.success_url + "?session_id={CHECKOUT_SESSION_ID}",
+            cancel_url=data.cancel_url,
+        )
+        return {"url": session.url, "session_id": session.id}
+    except _stripe.error.StripeError as e:
+        raise HTTPException(status_code=400, detail=f"Stripe エラー: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"内部エラー: {str(e)}")
 
 
 @app.post("/webhook/stripe", summary="Stripe Webhook（決済完了→ライセンス自動発行）")
