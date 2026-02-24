@@ -712,7 +712,6 @@ async def create_checkout(data: CheckoutRequest):
             mode="subscription",
             line_items=[{"price": price_id, "quantity": 1}],
             metadata={"plan": data.plan, "plan_name": plan_name},
-            customer_creation="always",
             billing_address_collection="required",
             success_url=data.success_url + "?session_id={CHECKOUT_SESSION_ID}",
             cancel_url=data.cancel_url,
