@@ -5,6 +5,7 @@ FastAPI + SQLite
 """
 
 from fastapi import FastAPI, HTTPException, Depends, Header, BackgroundTasks, Request
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from typing import Optional
@@ -95,6 +96,17 @@ def init_db():
             activated_at TEXT DEFAULT (datetime('now', 'localtime')),
             last_seen    TEXT DEFAULT (datetime('now', 'localtime')),
             UNIQUE(license_key, machine_id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pending_trials (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            token      TEXT UNIQUE NOT NULL,
+            name       TEXT NOT NULL,
+            email      TEXT NOT NULL,
+            company    TEXT,
+            created_at TEXT DEFAULT (datetime('now', 'localtime')),
+            expires_at TEXT NOT NULL
         )
     """)
     conn.commit()
@@ -224,9 +236,64 @@ class TrialRequest(BaseModel):
 # ─────────────────────────────
 # トライアルAPI（公開）
 # ─────────────────────────────
-@app.post("/api/trial/request", summary="14日間無料トライアル申込（公開）")
+
+def _html_trial_success(name: str, key: str, valid_until: str, install_cmd: str) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>トライアル開始 - NOVE OS</title>
+  <style>
+    body {{background:#0d1117;color:#f0f6fc;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}}
+    .card {{background:#161b22;border-radius:12px;padding:40px;max-width:600px;width:90%;text-align:center;}}
+    h1 {{color:#30d158;}}
+    .key {{font-family:monospace;font-size:20px;color:#ffd60a;background:#0d1117;padding:12px 24px;border-radius:8px;display:inline-block;margin:16px 0;}}
+    pre {{background:#1f2937;color:#30d158;padding:14px;border-radius:8px;text-align:left;overflow-x:auto;font-size:13px;}}
+    .btn {{display:inline-block;background:#0071e3;color:#fff;padding:12px 28px;border-radius:8px;text-decoration:none;margin-top:24px;}}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>🎉 トライアル開始！</h1>
+    <p>{name} 様のライセンスキーが発行されました。<br>詳細はメールでもお送りしています。</p>
+    <div class="key">{key}</div>
+    <p style="color:#8b949e;">有効期限: {valid_until}</p>
+    <p><strong>インストールコマンド:</strong></p>
+    <pre>{install_cmd}</pre>
+    <a href="https://noveos.jp/docs.html" class="btn">📚 ドキュメントを見る</a>
+  </div>
+</body>
+</html>"""
+
+
+def _html_trial_error(title: str, message: str) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>エラー - NOVE OS</title>
+  <style>
+    body {{background:#0d1117;color:#f0f6fc;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}}
+    .card {{background:#161b22;border-radius:12px;padding:40px;max-width:500px;width:90%;text-align:center;}}
+    h1 {{color:#ff453a;}}
+    .btn {{display:inline-block;background:#0071e3;color:#fff;padding:12px 28px;border-radius:8px;text-decoration:none;margin-top:24px;}}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>⚠️ {title}</h1>
+    <p>{message}</p>
+    <a href="https://noveos.jp/trial.html" class="btn">← 申し込みページへ戻る</a>
+  </div>
+</body>
+</html>"""
+
+
+@app.post("/api/trial/request", summary="14日間無料トライアル申込（公開）- メール確認あり")
 async def request_trial(data: TrialRequest, background_tasks: BackgroundTasks, db: sqlite3.Connection = Depends(get_db)):
-    # 同一メールでのトライアル重複チェック
+    # 発行済みライセンスで重複チェック
     existing = db.execute(
         "SELECT id FROM licenses WHERE customer_email=? AND plan='trial14'",
         (data.email,)
@@ -234,6 +301,105 @@ async def request_trial(data: TrialRequest, background_tasks: BackgroundTasks, d
     if existing:
         raise HTTPException(status_code=409, detail="このメールアドレスはすでにトライアルを使用済みです")
 
+    # 確認待ちメールの重複チェック
+    pending = db.execute(
+        "SELECT id, expires_at FROM pending_trials WHERE email=?",
+        (data.email,)
+    ).fetchone()
+    if pending:
+        # 期限切れなら再送可能にする
+        expires_at_dt = datetime.strptime(pending["expires_at"], "%Y-%m-%d %H:%M:%S")
+        if datetime.now() < expires_at_dt:
+            raise HTTPException(status_code=409, detail="このメールアドレスへはすでに確認メールを送信済みです。メールをご確認ください。")
+        # 期限切れなら古いレコードを削除して再送
+        db.execute("DELETE FROM pending_trials WHERE email=?", (data.email,))
+        db.commit()
+
+    # トークン生成（24時間有効）
+    token = str(uuid.uuid4())
+    expires_at = (datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        db.execute(
+            "INSERT INTO pending_trials(token,name,email,company,expires_at) VALUES(?,?,?,?,?)",
+            (token, data.name, data.email, data.company, expires_at)
+        )
+        db.commit()
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=500, detail="エラーが発生しました。再試行してください。")
+
+    verify_url = f"https://nove-infinity-project-production.up.railway.app/api/trial/verify?token={token}"
+
+    verify_body = f"""
+<div style="font-family:sans-serif;max-width:600px;margin:0 auto;background:#0d1117;color:#f0f6fc;padding:24px;border-radius:12px;">
+<h2 style="color:#30d158;">📧 NOVE OS - メールアドレス確認</h2>
+<p>{data.name} 様</p>
+<p>NOVE OS v13.2 14日間無料トライアルへのお申し込みありがとうございます。<br>
+以下のボタンをクリックしてメールアドレスを確認してください。<br>
+確認後、ライセンスキーをすぐにお送りします。</p>
+<div style="text-align:center;margin:32px 0;">
+  <a href="{verify_url}"
+     style="background:#0071e3;color:#fff;padding:14px 32px;border-radius:8px;text-decoration:none;font-size:16px;font-weight:bold;">
+    ✅ メールアドレスを確認する
+  </a>
+</div>
+<p style="color:#8b949e;font-size:13px;">
+このリンクは24時間有効です。<br>
+ボタンが動作しない場合は以下のURLをコピーしてブラウザで開いてください:<br>
+<a href="{verify_url}" style="color:#0071e3;word-break:break-all;">{verify_url}</a>
+</p>
+<p style="color:#8b949e;font-size:13px;">身に覚えのない場合はこのメールを無視してください。</p>
+<hr style="border-color:#30303a;margin:24px 0;">
+<p style="color:#8b949e;font-size:13px;">NOVE OS Systems | <a href="https://noveos.jp" style="color:#0071e3;">https://noveos.jp</a></p>
+</div>
+"""
+    background_tasks.add_task(
+        send_email, data.email,
+        "【NOVE OS】メールアドレスの確認 - トライアル申込",
+        verify_body
+    )
+
+    return {
+        "status":  "ok",
+        "message": "確認メールを送信しました。24時間以内にメールのリンクをクリックしてください。",
+    }
+
+
+@app.get("/api/trial/verify", summary="メール確認トークン検証・ライセンス発行", response_class=HTMLResponse)
+async def verify_trial(token: str, background_tasks: BackgroundTasks, db: sqlite3.Connection = Depends(get_db)):
+    # トークン確認
+    row = db.execute(
+        "SELECT * FROM pending_trials WHERE token=?", (token,)
+    ).fetchone()
+    if not row:
+        return HTMLResponse(
+            content=_html_trial_error("無効なリンクです", "このリンクは存在しないか、すでに使用済みです。"),
+            status_code=400
+        )
+
+    # 有効期限確認
+    expires_at_dt = datetime.strptime(row["expires_at"], "%Y-%m-%d %H:%M:%S")
+    if datetime.now() > expires_at_dt:
+        db.execute("DELETE FROM pending_trials WHERE token=?", (token,))
+        db.commit()
+        return HTMLResponse(
+            content=_html_trial_error("リンクの有効期限が切れました", "もう一度申し込みフォームからお申し込みください。"),
+            status_code=410
+        )
+
+    # 確認中に既存ライセンスが発行された場合
+    existing = db.execute(
+        "SELECT id FROM licenses WHERE customer_email=? AND plan='trial14'",
+        (row["email"],)
+    ).fetchone()
+    if existing:
+        db.execute("DELETE FROM pending_trials WHERE token=?", (token,))
+        db.commit()
+        return HTMLResponse(
+            content=_html_trial_error("すでにトライアルが発行済みです", "このメールアドレスはすでにトライアルを使用済みです。"),
+            status_code=409
+        )
+
+    # ライセンス発行
     plan_name, server_limit, _ = PLAN_LABELS["trial14"]
     key = generate_key("trial14")
     valid_from  = datetime.now().strftime("%Y-%m-%d")
@@ -244,28 +410,35 @@ async def request_trial(data: TrialRequest, background_tasks: BackgroundTasks, d
             """INSERT INTO licenses(license_key,plan,customer_name,customer_email,
                server_limit,valid_from,valid_until,note)
                VALUES(?,?,?,?,?,?,?,?)""",
-            (key, "trial14", data.name, data.email,
-             server_limit, valid_from, valid_until, f"会社: {data.company or '未記入'}")
+            (key, "trial14", row["name"], row["email"],
+             server_limit, valid_from, valid_until, f"会社: {row['company'] or '未記入'}")
         )
         db.commit()
     except sqlite3.IntegrityError:
-        raise HTTPException(status_code=500, detail="キー生成に失敗しました。再試行してください。")
+        return HTMLResponse(
+            content=_html_trial_error("エラーが発生しました", "ライセンスの生成に失敗しました。お手数ですがサポートまでお問い合わせください。"),
+            status_code=500
+        )
 
     # コンタクト保存
     db.execute(
         "INSERT INTO contacts(user_type,name,email,company,plan,message) VALUES(?,?,?,?,?,?)",
-        ("トライアル", data.name, data.email, data.company, "trial14", "14日間無料トライアル申込")
+        ("トライアル", row["name"], row["email"], row["company"], "trial14", "14日間無料トライアル申込（メール確認済み）")
     )
+    db.commit()
+
+    # pending_trialsから削除
+    db.execute("DELETE FROM pending_trials WHERE token=?", (token,))
     db.commit()
 
     install_cmd = f"curl -fsSL https://noveos.jp/install.sh | sudo bash -s {key}"
 
-    # ユーザーへメール
+    # ユーザーへライセンスメール
     user_body = f"""
 <div style="font-family:sans-serif;max-width:600px;margin:0 auto;background:#0d1117;color:#f0f6fc;padding:24px;border-radius:12px;">
 <h2 style="color:#30d158;">🎉 NOVE OS v13.2 14日間無料トライアル開始！</h2>
-<p>{data.name} 様</p>
-<p>14日間無料トライアルへのご参加ありがとうございます。<br>
+<p>{row['name']} 様</p>
+<p>メールアドレスの確認が完了しました。<br>
 Rocky Linux NOVE OS v13.2 チームです。</p>
 <table border="1" cellpadding="10" style="border-collapse:collapse;min-width:400px;margin:16px 0;">
 <tr style="background:#0071e3;color:#fff;"><th colspan="2" style="padding:12px;">トライアル情報</th></tr>
@@ -287,22 +460,17 @@ NOVE OS Systems | <a href="https://noveos.jp" style="color:#0071e3;">https://nov
 </div>
 """
     background_tasks.add_task(
-        send_email, data.email,
+        send_email, row["email"],
         "【NOVE OS】14日間無料トライアル開始 - ライセンスキーのご案内",
         user_body
     )
     background_tasks.add_task(
         send_email, NOTIFY_TO,
-        f"【トライアル申込】{data.name}様 / {data.email}",
-        f"Key: {key}<br>Company: {data.company or '-'}<br>Valid: {valid_until}"
+        f"【トライアル申込・確認完了】{row['name']}様 / {row['email']}",
+        f"Key: {key}<br>Company: {row['company'] or '-'}<br>Valid: {valid_until}"
     )
 
-    return {
-        "status":      "ok",
-        "license_key": key,
-        "valid_until": valid_until,
-        "install_cmd": install_cmd,
-    }
+    return HTMLResponse(content=_html_trial_success(row["name"], key, valid_until, install_cmd))
 
 
 # ─────────────────────────────
