@@ -733,6 +733,79 @@ async def revoke_license(key: str, admin=Depends(verify_admin), db: sqlite3.Conn
     return {"status": "ok", "message": f"{key} を無効化しました"}
 
 
+class LicenseRenew(BaseModel):
+    months:        int = 12
+    new_valid_until: str | None = None  # YYYY-MM-DD（指定があればそちら優先）
+
+
+@app.post("/api/license/{key}/renew", summary="ライセンス期間延長（管理者）")
+async def renew_license(
+    key: str,
+    data: LicenseRenew,
+    background_tasks: BackgroundTasks,
+    admin=Depends(verify_admin),
+    db: sqlite3.Connection = Depends(get_db)
+):
+    """有効期限を延長する。new_valid_until が指定されればその日付を使用し、
+    なければ現在の valid_until から months ヶ月延長する。"""
+    row = db.execute(
+        "SELECT license_key, plan, customer_name, customer_email, valid_until FROM licenses WHERE license_key=?",
+        (key,)
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="ライセンスキーが見つかりません")
+
+    lic_key, plan, cname, cemail, current_until = row
+
+    if data.new_valid_until:
+        new_until = data.new_valid_until
+    else:
+        try:
+            base = datetime.strptime(current_until, "%Y-%m-%d")
+        except (ValueError, TypeError):
+            base = datetime.now()
+        # 期限切れの場合は今日から延長
+        if base < datetime.now():
+            base = datetime.now()
+        new_until = (base + timedelta(days=30 * data.months)).strftime("%Y-%m-%d")
+
+    db.execute(
+        "UPDATE licenses SET valid_until=?, is_active=1 WHERE license_key=?",
+        (new_until, key)
+    )
+    db.commit()
+
+    # 更新完了メール送信
+    plan_info = PLAN_LABELS.get(plan, (plan, "-", "-"))
+    plan_name = plan_info[0]
+    mail_body = f"""
+<h2>🔄 NOVE OS ライセンス更新完了のご案内</h2>
+<p>{cname} 様</p>
+<p>ライセンスの有効期限が延長されました。</p>
+<table border="1" cellpadding="10" style="border-collapse:collapse; min-width:400px;">
+<tr style="background:#0071e3;color:#fff;"><th colspan="2">更新後ライセンス情報</th></tr>
+<tr><th>ライセンスキー</th><td><strong style="font-size:16px;font-family:monospace;">{lic_key}</strong></td></tr>
+<tr><th>プラン</th><td>{plan_name}</td></tr>
+<tr><th>新しい有効期限</th><td><strong>{new_until}</strong></td></tr>
+</table>
+<br>
+<p>引き続きNOVE OSをご利用いただきありがとうございます。</p>
+<p style="color:#666;font-size:12px;">NOVE OS Systems | <a href="https://noveos.jp">https://noveos.jp</a></p>
+"""
+    if cemail:
+        background_tasks.add_task(send_email, cemail, f"【NOVE OS】ライセンス更新完了 - {new_until}まで", mail_body)
+    background_tasks.add_task(send_email, NOTIFY_TO, f"【更新完了】{cname}様 / {plan_name} → {new_until}", f"Key: {lic_key}")
+
+    return {
+        "status": "ok",
+        "license_key": lic_key,
+        "plan": plan_name,
+        "customer_name": cname,
+        "new_valid_until": new_until,
+        "months_extended": data.months
+    }
+
+
 @app.get("/api/mail/status", summary="メール設定確認")
 async def mail_status(admin=Depends(verify_admin)):
     """SMTP / Resend の設定状態を確認"""
